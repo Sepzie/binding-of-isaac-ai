@@ -336,6 +336,192 @@ Commands: `step` (normal tick), `reset` (restart episode), `configure` (change s
 
 ---
 
+## Isaac Lua Modding API Reference
+
+This section documents the Isaac Afterbirth+ Lua API patterns needed to build
+the environment mod. Extracted from the reference implementation at
+https://github.com/2-X/binding-of-isaac-ai.
+
+### Mod Registration and Callbacks
+
+```lua
+-- Register mod
+mod = RegisterMod("IsaacRL", 1)
+
+-- Add callbacks
+mod:AddCallback(ModCallbacks.MC_POST_GAME_STARTED, onGameStart)
+mod:AddCallback(ModCallbacks.MC_POST_NEW_LEVEL, onNewLevel)
+mod:AddCallback(ModCallbacks.MC_POST_NEW_ROOM, onNewRoom)
+mod:AddCallback(ModCallbacks.MC_POST_UPDATE, onUpdate)        -- 30 ticks/sec game logic
+mod:AddCallback(ModCallbacks.MC_POST_RENDER, onRender)        -- every render frame
+mod:AddCallback(ModCallbacks.MC_INPUT_ACTION, onInputRequest) -- intercepts all input
+mod:AddCallback(ModCallbacks.MC_ENTITY_TAKE_DMG, onDamage, EntityType)
+```
+
+### Input Injection
+
+The MC_INPUT_ACTION callback intercepts input queries. Return values to
+override player controls programmatically:
+
+```lua
+function onInputRequest(_, entity, inputHook, buttonAction)
+  -- inputHook types:
+  --   InputHook.GET_ACTION_VALUE   → return 1.0 (pressed) or nil (not pressed)
+  --   InputHook.IS_ACTION_PRESSED  → return true/false
+  --   InputHook.IS_ACTION_TRIGGERED → return true/false
+
+  -- buttonAction constants:
+  --   ButtonAction.ACTION_LEFT / ACTION_RIGHT / ACTION_UP / ACTION_DOWN
+  --   ButtonAction.ACTION_SHOOTLEFT / ACTION_SHOOTRIGHT / ACTION_SHOOTUP / ACTION_SHOOTDOWN
+
+  if inputHook == InputHook.GET_ACTION_VALUE then
+    if buttonAction == desiredMoveDirection then
+      return 1.0
+    end
+    if buttonAction == desiredShootDirection then
+      return 1.0
+    end
+  end
+  return nil  -- nil = don't override, let default input through
+end
+```
+
+### Reading Game State
+
+```lua
+-- Player
+local player = Isaac.GetPlayer(0)
+local pos = player.Position           -- Vector with .X, .Y (world coordinates)
+local screenPos = Isaac.WorldToScreen(pos)
+
+-- Room
+local room = Game():GetRoom()
+local gridWidth = room:GetGridWidth()    -- typically 13
+local gridHeight = room:GetGridHeight()  -- typically 7
+local gridSize = room:GetGridSize()      -- total cells
+
+-- Level
+local level = Game():GetLevel()
+local roomIndex = level:GetCurrentRoomDesc().GridIndex  -- stable room ID
+```
+
+### Grid Coordinate System
+
+Grid indices are 0-based linear integers. For a room of width W:
+```lua
+gridIndex = y * W + x
+x = gridIndex % W
+y = math.floor(gridIndex / W)
+
+-- Adjacent indices (8-directional)
+UP    = idx - W;    DOWN  = idx + W
+LEFT  = idx - 1;    RIGHT = idx + 1
+UPLEFT = idx - W - 1;  UPRIGHT = idx - W + 1
+DOWNLEFT = idx + W - 1; DOWNRIGHT = idx + W + 1
+
+-- Convert between grid and world positions
+local worldPos = room:GetGridPosition(gridIndex)
+local gridIdx = room:GetClampedGridIndex(worldPos)
+```
+
+### Grid Entities (Obstacles, Terrain)
+
+```lua
+local gridEntity = room:GetGridEntity(gridIndex)
+if gridEntity then
+  local entityType = gridEntity:GetType()
+  local state = gridEntity:GetSaveState().State
+end
+```
+
+Key GridEntityType constants:
+- `GRID_ROCK` / `GRID_ROCKB` / `GRID_ROCKT` / `GRID_ROCK_ALT` — destructible rocks
+- `GRID_PIT` — holes
+- `GRID_SPIKES` / `GRID_SPIKES_ONOFF` — spikes
+- `GRID_POOP` — destructible poop
+- `GRID_SPIDERWEB` — slowing web
+- `GRID_TNT` — explosive
+- `GRID_FIREPLACE` — fire
+- `GRID_WALL` — impassable wall
+- `GRID_DOOR` — door
+- `GRID_TRAPDOOR` — floor exit (State: 0=closed, 1=open)
+- `GRID_PRESSURE_PLATE` — button (State: 0=unpressed, >0=pressed)
+
+State values are entity-specific: Rock State==2 means destroyed, TNT State==4 means destroyed.
+
+### Room Entities (Enemies, Items, Pickups)
+
+```lua
+local entityList = room:GetEntities()
+for i = 0, entityList:__len() - 1 do
+  local entity = entityList:Get(i)
+  -- entity.Type     (number)
+  -- entity.Variant  (number)
+  -- entity.SubType  (number)
+  -- entity.Position (Vector)
+  -- entity:IsActiveEnemy() → boolean
+end
+```
+
+Important entity types:
+- Type 1 = Player
+- Type 2 = Tear (player projectile)
+- Type 3 = Familiar
+- Type 4 = Bomb
+- Type 5, Variant 100 = Pedestal item (SubType = item ID, 0 = empty pedestal)
+- Type 5, Variant 340/370 = Trophy (win condition)
+- Type 9 = Projectile (enemy)
+
+Entity flags: `entity:GetEntityFlags()` returns a bitmask. Flag bit 20 = dying boss.
+
+### Doors
+
+```lua
+for _, doorSlot in pairs(DoorSlot) do
+  local door = room:GetDoor(doorSlot)
+  if door then
+    door.Position        -- world position
+    door.TargetRoomType  -- RoomType enum of destination
+    door:IsLocked()      -- boolean
+    door:CanBlowOpen()   -- boolean (secret room walls)
+    -- Get stable room index for the target:
+    local targetGridIndex = level:GetRoomByIdx(door.TargetRoomIndex).GridIndex
+  end
+end
+```
+
+RoomType constants: `ROOM_DEFAULT`, `ROOM_BOSS`, `ROOM_TREASURE`, `ROOM_SECRET`,
+`ROOM_SUPERSECRET`, etc.
+
+### Debug Commands
+
+```lua
+Isaac.ExecuteCommand("debug 3")     -- invincibility
+Isaac.ExecuteCommand("debug 8")     -- show damage values
+Isaac.ExecuteCommand("debug 10")    -- show enemy HP
+Isaac.ExecuteCommand("restart")     -- restart run
+Isaac.ExecuteCommand("stage 1")     -- go to specific stage
+Isaac.ExecuteCommand("spawn 10.0")  -- spawn entity (type.variant.subtype)
+Isaac.ConsoleOutput("message")      -- print to debug console
+```
+
+### Gotchas
+
+1. **Door TargetRoomIndex is unstable** — always convert via
+   `level:GetRoomByIdx(door.TargetRoomIndex).GridIndex` for stable tracking
+2. **EntityList iteration** — must use `:Get(i)` loop with `__len()`, can't use pairs()
+3. **Input return values matter** — return `1.0` for GET_ACTION_VALUE, `true/false`
+   for IS_ACTION_PRESSED, `nil` to not override
+4. **Grid vs World coords** — entity positions are continuous world coords, grid indices
+   are discrete integers. Must convert between them.
+5. **Lua negative modulo** — Lua's `%` operator can return negative values. Use a custom
+   `modulo(a, b)` function: `return a - math.floor(a/b) * b`
+6. **Entity type confusion** — some grid entities (spike blocks, statues, certain door
+   decorations) can be falsely detected as enemies. Filter by `entity:IsActiveEnemy()`
+   and exclude known false positives.
+
+---
+
 ## Open Questions / Risks
 
 1. **Game speed** — Can we run Isaac faster than real-time? Investigate debug console
